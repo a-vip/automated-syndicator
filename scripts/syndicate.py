@@ -3,14 +3,18 @@ import json
 import urllib.request
 import urllib.parse
 from html.parser import HTMLParser
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 # Configuration
 DEV_TO_API_URL = "https://dev.to/api/articles"
 WP_API_URL = "https://aviperera.com/wp-json/wp/v2/posts"
 STATE_FILE = "posted.json"
+BLOGGER_BLOG_ID = "7370356485249616409"
 
 # Secrets
 DEV_API_KEY = os.environ.get("DEV_API_KEY")
+GOOGLE_OAUTH_TOKEN_JSON = os.environ.get("GOOGLE_OAUTH_TOKEN_JSON") # We will store the token.json contents here
 
 class HTMLFilter(HTMLParser):
     text = ""
@@ -47,11 +51,9 @@ def post_to_dev_to(post):
         print("Error: DEV_API_KEY environment variable not set.")
         return False
         
-    # WP API gives rendered HTML for title and content
     title = strip_tags(post['title']['rendered']).replace("&#8211;", "-").replace("&#8217;", "'")
     content = post['content']['rendered']
     link = post['link']
-    post_id = str(post['id'])
     
     payload = {
         "article": {
@@ -83,52 +85,80 @@ def post_to_dev_to(post):
         print(f"Exception while posting to Dev.to: {e}")
         return False
 
+def post_to_blogger(post):
+    if not GOOGLE_OAUTH_TOKEN_JSON:
+        print("Error: GOOGLE_OAUTH_TOKEN_JSON environment variable not set.")
+        return False
+        
+    try:
+        creds_data = json.loads(GOOGLE_OAUTH_TOKEN_JSON)
+        creds = Credentials.from_authorized_user_info(creds_data)
+        service = build('blogger', 'v3', credentials=creds)
+        
+        title = strip_tags(post['title']['rendered']).replace("&#8211;", "-").replace("&#8217;", "'")
+        content = post['content']['rendered']
+        link = post['link']
+        
+        # Inject canonical link into the HTML content and add a visible backlink
+        html_content = f'{content}<br><hr><p><em>Originally published at <a href="{link}">{title}</a>.</em></p>'
+        
+        body = {
+            "kind": "blogger#post",
+            "title": title,
+            "content": html_content
+        }
+        
+        posts = service.posts()
+        request = posts.insert(blogId=BLOGGER_BLOG_ID, body=body, isDraft=False)
+        response = request.execute()
+        
+        print(f"Successfully posted to Blogger: {response.get('url')}")
+        return True
+    except Exception as e:
+        print(f"Exception while posting to Blogger: {e}")
+        return False
+
 def main():
     print("Starting automated syndication with backfill...")
     posted_ids = load_posted()
-    
-    # Strategy: 
-    # 1. Fetch page 1 (newest posts)
-    # 2. If the newest post is NOT in posted_ids, publish it (priority to fresh content)
-    # 3. If the newest post IS in posted_ids, we scan backwards through pages to find the oldest unposted article and publish just ONE to backfill.
     
     newest_posts = fetch_wp_posts(page=1)
     if not newest_posts:
         return
         
-    # Check if the absolute newest post needs to be published
     newest_post = newest_posts[0]
     if str(newest_post['id']) not in posted_ids:
         print(f"Newest article found: {newest_post['title']['rendered']}")
-        if post_to_dev_to(newest_post):
+        dev_success = post_to_dev_to(newest_post)
+        blogger_success = post_to_blogger(newest_post)
+        
+        if dev_success or blogger_success:
             posted_ids.append(str(newest_post['id']))
             save_posted(posted_ids)
         return
 
     print("No fresh articles today. Scanning archive for backfill...")
     
-    # Backfill logic: scan pages until we find an unposted article
-    # We want to publish the oldest unposted article we can find
     page = 1
     unposted_found = None
     
     while True:
         posts = fetch_wp_posts(page=page)
         if not posts:
-            break # Reached the end of the blog
+            break
             
         for post in posts:
             if str(post['id']) not in posted_ids:
-                # Keep tracking the oldest unposted we find
                 unposted_found = post
                 
-        # If we reached a page where everything is posted but we found an unposted one earlier on the page, we break
-        # Actually, we want to go as deep as possible to find the absolute oldest.
         page += 1
 
     if unposted_found:
         print(f"Backfilling archive article: {unposted_found['title']['rendered']}")
-        if post_to_dev_to(unposted_found):
+        dev_success = post_to_dev_to(unposted_found)
+        blogger_success = post_to_blogger(unposted_found)
+        
+        if dev_success or blogger_success:
             posted_ids.append(str(unposted_found['id']))
             save_posted(posted_ids)
     else:
