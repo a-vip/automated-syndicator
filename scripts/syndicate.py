@@ -2,19 +2,20 @@ import os
 import json
 import urllib.request
 import urllib.parse
+import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 # Configuration
 DEV_TO_API_URL = "https://dev.to/api/articles"
-WP_API_URL = "https://aviperera.com/wp-json/wp/v2/posts"
+RSS_FEED_URL = "https://aviperera.com/feed/"
 STATE_FILE = "posted.json"
 BLOGGER_BLOG_ID = "7370356485249616409"
 
 # Secrets
 DEV_API_KEY = os.environ.get("DEV_API_KEY")
-GOOGLE_OAUTH_TOKEN_JSON = os.environ.get("GOOGLE_OAUTH_TOKEN_JSON") # We will store the token.json contents here
+GOOGLE_OAUTH_TOKEN_JSON = os.environ.get("GOOGLE_OAUTH_TOKEN_JSON")
 
 class HTMLFilter(HTMLParser):
     text = ""
@@ -36,14 +37,42 @@ def save_posted(posted_guids):
     with open(STATE_FILE, "w") as f:
         json.dump(posted_guids, f, indent=2)
 
-def fetch_wp_posts(page=1, per_page=20):
-    url = f"{WP_API_URL}?page={page}&per_page={per_page}"
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+def fetch_rss_page(page=1):
+    url = f"{RSS_FEED_URL}?paged={page}" if page > 1 else RSS_FEED_URL
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'})
     try:
         with urllib.request.urlopen(req) as response:
-            return json.loads(response.read().decode('utf-8'))
+            xml_data = response.read()
+            return parse_rss(xml_data)
     except Exception as e:
-        print(f"Failed to fetch WP posts on page {page}: {e}")
+        print(f"Failed to fetch RSS page {page}: {e}")
+        return []
+
+def parse_rss(xml_data):
+    try:
+        root = ET.fromstring(xml_data)
+        articles = []
+        for item in root.findall('./channel/item'):
+            guid = item.find('guid').text
+            title = item.find('title').text
+            link = item.find('link').text
+            
+            content_elem = item.find('{http://purl.org/rss/1.0/modules/content/}encoded')
+            if content_elem is not None:
+                content = content_elem.text
+            else:
+                desc_elem = item.find('description')
+                content = desc_elem.text if desc_elem is not None else ""
+                
+            articles.append({
+                'id': guid, # Using guid as ID
+                'title': title,
+                'link': link,
+                'content': content
+            })
+        return articles
+    except Exception as e:
+        print(f"Error parsing RSS XML: {e}")
         return []
 
 def post_to_dev_to(post):
@@ -51,8 +80,8 @@ def post_to_dev_to(post):
         print("Error: DEV_API_KEY environment variable not set.")
         return False
         
-    title = strip_tags(post['title']['rendered']).replace("&#8211;", "-").replace("&#8217;", "'")
-    content = post['content']['rendered']
+    title = strip_tags(post['title']).replace("&#8211;", "-").replace("&#8217;", "'")
+    content = post['content']
     link = post['link']
     
     payload = {
@@ -95,11 +124,10 @@ def post_to_blogger(post):
         creds = Credentials.from_authorized_user_info(creds_data)
         service = build('blogger', 'v3', credentials=creds)
         
-        title = strip_tags(post['title']['rendered']).replace("&#8211;", "-").replace("&#8217;", "'")
-        content = post['content']['rendered']
+        title = strip_tags(post['title']).replace("&#8211;", "-").replace("&#8217;", "'")
+        content = post['content']
         link = post['link']
         
-        # Inject canonical link into the HTML content and add a visible backlink
         html_content = f'{content}<br><hr><p><em>Originally published at <a href="{link}">{title}</a>.</em></p>'
         
         body = {
@@ -119,21 +147,21 @@ def post_to_blogger(post):
         return False
 
 def main():
-    print("Starting automated syndication with backfill...")
+    print("Starting automated syndication with backfill (via RSS)...")
     posted_ids = load_posted()
     
-    newest_posts = fetch_wp_posts(page=1)
+    newest_posts = fetch_rss_page(page=1)
     if not newest_posts:
         return
         
     newest_post = newest_posts[0]
-    if str(newest_post['id']) not in posted_ids:
-        print(f"Newest article found: {newest_post['title']['rendered']}")
+    if newest_post['id'] not in posted_ids:
+        print(f"Newest article found: {newest_post['title']}")
         dev_success = post_to_dev_to(newest_post)
         blogger_success = post_to_blogger(newest_post)
         
         if dev_success or blogger_success:
-            posted_ids.append(str(newest_post['id']))
+            posted_ids.append(newest_post['id'])
             save_posted(posted_ids)
         return
 
@@ -143,23 +171,23 @@ def main():
     unposted_found = None
     
     while True:
-        posts = fetch_wp_posts(page=page)
+        posts = fetch_rss_page(page=page)
         if not posts:
             break
             
         for post in posts:
-            if str(post['id']) not in posted_ids:
+            if post['id'] not in posted_ids:
                 unposted_found = post
                 
         page += 1
 
     if unposted_found:
-        print(f"Backfilling archive article: {unposted_found['title']['rendered']}")
+        print(f"Backfilling archive article: {unposted_found['title']}")
         dev_success = post_to_dev_to(unposted_found)
         blogger_success = post_to_blogger(unposted_found)
         
         if dev_success or blogger_success:
-            posted_ids.append(str(unposted_found['id']))
+            posted_ids.append(unposted_found['id'])
             save_posted(posted_ids)
     else:
         print("Archive is completely fully syndicated!")
